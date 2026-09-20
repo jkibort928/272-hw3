@@ -4,7 +4,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  SAM Template for Serverless Patterns - v2 Lambda function
+  SAM Template for Serverless Patterns v3 Connect API
 
 Globals:
   Function:
@@ -39,6 +39,46 @@ Resources:
             TableName: !Ref UsersTable
       Tags:
         Stack: !Sub "${AWS::StackName}"
+      Events:
+        GetUsersEvent:
+          Type: Api
+          Properties:
+            Path: /users
+            Method: get
+            RestApiId: !Ref RestAPI
+        PutUserEvent:
+          Type: Api
+          Properties:
+            Path: /users
+            Method: post
+            RestApiId: !Ref RestAPI
+        UpdateUserEvent:
+          Type: Api
+          Properties:
+            Path: /users/{userid}
+            Method: put
+            RestApiId: !Ref RestAPI
+        GetUserEvent:
+          Type: Api
+          Properties:
+            Path: /users/{userid}
+            Method: get
+            RestApiId: !Ref RestAPI
+        DeleteUserEvent:
+          Type: Api
+          Properties:
+            Path: /users/{userid}
+            Method: delete
+            RestApiId: !Ref RestAPI
+
+  RestAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      TracingEnabled: true
+      Tags:
+        Name: !Sub "${AWS::StackName}-API"
+        Stack: !Sub "${AWS::StackName}"      
 
 Outputs:
   UsersTable:
@@ -46,5 +86,9 @@ Outputs:
     Value: !Ref UsersTable
 
   UsersFunction:
-    Description: "Lambda function used to perform actions on the users data"
+    Description: "Lambda function used to perform actions on the users’ data"
     Value: !Ref UsersFunction
+
+  APIEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/Prod"
