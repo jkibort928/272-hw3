@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'SAM Template for orders
+
+  '
+Globals:
+  Api:
+    TracingEnabled: true
+Parameters:
+  UserPool:
+    Type: String
+    Description: User Pool ID produced by the Users module
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: userId
+        AttributeType: S
+      - AttributeName: orderId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: userId
+        KeyType: HASH
+      - AttributeName: orderId
+        KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+  WorkshopApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: Module3CognitoAuthorizer
+        Authorizers:
+          Module3CognitoAuthorizer:
+            UserPoolArn:
+              Fn::Sub: arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPool}
+  OrdersLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: python3.12
+      SamResourceId: OrdersLayer
+    Properties:
+      LayerName:
+        Fn::Sub: ${AWS::StackName}-orders-layer
+      Description: Shared Python dependencies for Orders Lambda functions
+      ContentUri: OrdersLayer
+      CompatibleRuntimes:
+      - python3.12
+      RetentionPolicy: Delete
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: GetOrderFunction
+      Handler: get_order.lambda_handler
+      Layers:
+      - Ref: OrdersLayer
+      Runtime: python3.12
+      Tracing: Active
+      Policies:
+      - DynamoDBReadPolicy:
+          TableName:
+            Ref: OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: OrdersTable
+      Events:
+        GetOrder:
+          Type: Api
+          Properties:
+            Path: /orders/{orderId}
+            Method: get
+            RestApiId:
+              Ref: WorkshopApiGateway
+            Auth:
+              Authorizer: Module3CognitoAuthorizer
+    Metadata:
+      SamResourceId: GetOrderFunction
+  AddOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: AddOrderFunction
+      Handler: create_order.lambda_handler
+      Layers:
+      - Ref: OrdersLayer
+      Runtime: python3.12
+      Tracing: Active
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: OrdersTable
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: post
+            RestApiId:
+              Ref: WorkshopApiGateway
+    Metadata:
+      SamResourceId: AddOrderFunction
+  ListOrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ListOrdersFunction
+      Handler: list_orders.lambda_handler
+      Runtime: python3.12
+      Tracing: Active
+      Policies:
+      - DynamoDBReadPolicy:
+          TableName:
+            Ref: OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: OrdersTable
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: get
+            RestApiId:
+              Ref: WorkshopApiGateway
+    Metadata:
+      SamResourceId: ListOrdersFunction
+  EditOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: EditOrderFunction
+      Handler: edit_order.lambda_handler
+      Runtime: python3.12
+      Tracing: Active
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: OrdersTable
+      Layers:
+      - Ref: OrdersLayer
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /orders/{orderId}
+            Method: put
+            RestApiId:
+              Ref: WorkshopApiGateway
+    Metadata:
+      SamResourceId: EditOrderFunction
+  CancelOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: CancelOrderFunction
+      Handler: cancel_order.lambda_handler
+      Runtime: python3.12
+      Tracing: Active
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: OrdersTable
+      Layers:
+      - Ref: OrdersLayer
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /orders/{orderId}
+            Method: delete
+            RestApiId:
+              Ref: WorkshopApiGateway
+    Metadata:
+      SamResourceId: CancelOrderFunction
+Outputs:
+  OrdersServiceEndpoint:
+    Description: API Gateway endpoint URL
+    Value:
+      Fn::Sub: https://${WorkshopApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod
+  OrdersTable:
+    Description: DynamoDb Orders Table
+    Value:
+      Ref: OrdersTable
