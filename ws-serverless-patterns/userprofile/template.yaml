@@ -1,0 +1,681 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM Template for userprofile - Module 4, Asynchronous Invocation.
+
+  Demonstrates two asynchronous integration patterns in which API Gateway calls an
+  AWS service directly, with no Lambda in the write path:
+    addresses  API Gateway -> EventBridge -> Lambda -> DynamoDB
+    favorites  API Gateway -> SQS         -> Lambda -> DynamoDB
+  Reads stay synchronous Lambda proxy integrations, so the contrast is visible.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 128
+    Timeout: 20
+    Tracing: Active
+  Api:
+    TracingEnabled: true  # Enables AWS X-Ray tracing for the API Gateway.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: Prod
+    Description: API Gateway stage name
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Authentication.
+  #
+  # Modules 1-3 live in a different AWS account, so this stack cannot reference
+  # the Users module's pool the way the Orders module does. It creates its own
+  # so it deploys standalone.
+  # ---------------------------------------------------------------------------
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-UserPool
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      UsernameAttributes:
+        - email
+      UserPoolTags:
+        Key: Name
+        Value: !Sub ${AWS::StackName} User Pool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}UserPoolClient
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH  # Required by the integration tests to mint tokens.
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      RefreshTokenValidity: 30
+      SupportedIdentityProviders:
+        - COGNITO
+      UserPoolId: !Ref UserPool
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - 'code'
+      AllowedOAuthScopes:
+        - 'email'
+        - 'openid'
+      CallbackURLs:
+        - 'http://localhost'
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref UserPoolClient
+      UserPoolId: !Ref UserPool
+
+  # ---------------------------------------------------------------------------
+  # Data stores
+  # ---------------------------------------------------------------------------
+
+  UserAddressesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "user_id"
+          AttributeType: "S"
+        - AttributeName: "address_id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "user_id"
+          KeyType: "HASH"
+        - AttributeName: "address_id"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+
+  FavoritesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "user_id"
+          AttributeType: "S"
+        - AttributeName: "restaurant_id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "user_id"
+          KeyType: "HASH"
+        - AttributeName: "restaurant_id"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+
+  # ---------------------------------------------------------------------------
+  # Pattern A: addresses, via an EventBridge custom bus.
+  #
+  # API Gateway PutEvents onto the bus; one rule per detail-type routes to its
+  # own consumer. Adding a new consumer means adding a rule, not touching the API.
+  # ---------------------------------------------------------------------------
+
+  AddressBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${AWS::StackName}-AddressBus"
+
+  AddUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/address
+      Handler: add_user_address.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UserAddressesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+      Events:
+        AddressAdded:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source:
+                - customer-profile
+              detail-type:
+                - address.added
+
+  EditUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/address
+      Handler: edit_user_address.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UserAddressesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+      Events:
+        AddressUpdated:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source:
+                - customer-profile
+              detail-type:
+                - address.updated
+
+  DeleteUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/address
+      Handler: delete_user_address.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UserAddressesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+      Events:
+        AddressDeleted:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source:
+                - customer-profile
+              detail-type:
+                - address.deleted
+
+  # ---------------------------------------------------------------------------
+  # Pattern B: favourite restaurants, via SQS.
+  #
+  # A single queue carries both commands; the consumer dispatches on the
+  # CommandName message attribute. SQS preserves ordering per message group and
+  # gives back-pressure, which the EventBridge fan-out does not.
+  # ---------------------------------------------------------------------------
+
+  FavoriteRestaurantsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-FavoriteRestaurants"
+      # Must be >= the consumer's timeout or messages redeliver mid-processing.
+      VisibilityTimeout: 120
+
+  FavoriteRestaurantsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FavoriteRestaurantsQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt APIGatewayQueueCommandRole.Arn
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt FavoriteRestaurantsQueue.Arn
+
+  ProcessFavoriteRestaurantsQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/favorites
+      Handler: process_favorites_queue.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FavoritesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FavoritesTable
+      Events:
+        FavoritesQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FavoriteRestaurantsQueue.Arn
+            BatchSize: 10
+
+  # ---------------------------------------------------------------------------
+  # Synchronous reads. These are ordinary Lambda proxy integrations - the
+  # counterpoint that makes the asynchronous writes observable.
+  # ---------------------------------------------------------------------------
+
+  ListUserAddressesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/address
+      Handler: list_user_addresses.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserAddressesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserAddressesTable
+
+  ListUserFavoritesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/favorites
+      Handler: list_user_favorites.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FavoritesTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FavoritesTable
+
+  # api.yaml wires these two by ARN rather than through a SAM Events block, so
+  # SAM does not generate the invoke permission for us. Without these the GET
+  # routes return 500.
+  ListUserAddressesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListUserAddressesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProfileApiGateway}/*/GET/address"
+
+  ListUserFavoritesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListUserFavoritesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProfileApiGateway}/*/GET/favorite"
+
+  # ---------------------------------------------------------------------------
+  # Roles API Gateway assumes to call EventBridge and SQS on the caller's behalf.
+  # Each is scoped to the single target it needs.
+  # ---------------------------------------------------------------------------
+
+  ApiGatewayEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: PutEventsOnAddressBus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "events:PutEvents"
+                Resource: !GetAtt AddressBus.Arn
+
+  APIGatewayQueueCommandRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyName: SendMessageToFavoritesQueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "sqs:SendMessage"
+                Resource: !GetAtt FavoriteRestaurantsQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # API Gateway access logging is enabled per stage, but the CloudWatch Logs
+  # role it writes through is an account-wide, per-region setting. A fresh
+  # account has none, and the stage then fails to create.
+  # ---------------------------------------------------------------------------
+
+  ApiLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccountLoggingSettings:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiLoggingRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # The API. Routes and their integrations are inlined below, because the VTL
+  # mapping templates are too verbose to read comfortably anywhere else.
+  # ---------------------------------------------------------------------------
+
+  ProfileApiGateway:
+    Type: AWS::Serverless::Api
+    # The account-level logging role must exist before a stage that logs.
+    DependsOn: ApiGatewayAccountLoggingSettings
+    Properties:
+      StageName: !Ref Stage
+      EndpointConfiguration:
+        Type: REGIONAL
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: !Sub "${AWS::StackName}-profile-api"
+          description: >
+            User profile API. Writes are asynchronous: API Gateway hands the request to
+            EventBridge or SQS and returns 202 immediately, before any Lambda has run.
+            Reads are synchronous Lambda proxy integrations.
+          version: "1.0"
+
+        components:
+          securitySchemes:
+            CognitoAuthorizer:
+              type: apiKey
+              name: Authorization
+              in: header
+              x-amazon-apigateway-authtype: cognito_user_pools
+              x-amazon-apigateway-authorizer:
+                type: cognito_user_pools
+                providerARNs:
+                  - !GetAtt UserPool.Arn
+
+          schemas:
+            UserAddressInputModel:
+              type: object
+              required:
+                - line1
+                - city
+                - stateProvince
+                - postal
+              properties:
+                line1:
+                  type: string
+                line2:
+                  type: string
+                city:
+                  type: string
+                stateProvince:
+                  type: string
+                postal:
+                  type: string
+
+        # Reject malformed bodies at the edge. Without this a bad request is accepted,
+        # returns 202, and then fails invisibly inside a consumer Lambda.
+        x-amazon-apigateway-request-validators:
+          body-only:
+            validateRequestBody: true
+            validateRequestParameters: false
+
+        security:
+          - CognitoAuthorizer: []
+
+        paths:
+
+          # ---------------------------------------------------------------------------
+          # Addresses -> EventBridge
+          #
+          # userId always comes from the verified Cognito token, never from the client.
+          # ---------------------------------------------------------------------------
+
+          /address:
+            post:
+              summary: Accept a new address for asynchronous processing
+              x-amazon-apigateway-request-validator: body-only
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: "#/components/schemas/UserAddressInputModel"
+              responses:
+                "202":
+                  description: Accepted for processing
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:events:action/PutEvents"
+                credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($inputRoot = $input.path('$'))
+                    {
+                      "Entries": [{
+                        "Source": "customer-profile",
+                        "DetailType": "address.added",
+                        "EventBusName": "${AddressBus}",
+                        "Detail": "{\"userId\": \"$context.authorizer.claims.sub\", \"line1\": \"$util.escapeJavaScript($inputRoot.line1)\", \"line2\": \"$util.escapeJavaScript($inputRoot.line2)\", \"city\": \"$util.escapeJavaScript($inputRoot.city)\", \"stateProvince\": \"$util.escapeJavaScript($inputRoot.stateProvince)\", \"postal\": \"$util.escapeJavaScript($inputRoot.postal)\"}"
+                      }]
+                    }
+                responses:
+                  default:
+                    statusCode: "202"
+                    responseTemplates:
+                      application/json: '{"message": "Accepted"}'
+
+            get:
+              summary: List the caller's addresses (synchronous)
+              responses:
+                "200":
+                  description: The caller's addresses
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListUserAddressesFunction.Arn}/invocations"
+                passthroughBehavior: when_no_match
+
+          /address/{addressId}:
+            put:
+              summary: Accept an address update for asynchronous processing
+              parameters:
+                - name: addressId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: "#/components/schemas/UserAddressInputModel"
+              responses:
+                "202":
+                  description: Accepted for processing
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:events:action/PutEvents"
+                credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($inputRoot = $input.path('$'))
+                    {
+                      "Entries": [{
+                        "Source": "customer-profile",
+                        "DetailType": "address.updated",
+                        "EventBusName": "${AddressBus}",
+                        "Detail": "{\"userId\": \"$context.authorizer.claims.sub\", \"addressId\": \"$util.escapeJavaScript($input.params('addressId'))\", \"line1\": \"$util.escapeJavaScript($inputRoot.line1)\", \"line2\": \"$util.escapeJavaScript($inputRoot.line2)\", \"city\": \"$util.escapeJavaScript($inputRoot.city)\", \"stateProvince\": \"$util.escapeJavaScript($inputRoot.stateProvince)\", \"postal\": \"$util.escapeJavaScript($inputRoot.postal)\"}"
+                      }]
+                    }
+                responses:
+                  default:
+                    statusCode: "202"
+                    responseTemplates:
+                      application/json: '{"message": "Accepted"}'
+
+            delete:
+              summary: Accept an address deletion for asynchronous processing
+              parameters:
+                - name: addressId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              responses:
+                "202":
+                  description: Accepted for processing
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:events:action/PutEvents"
+                credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "Entries": [{
+                        "Source": "customer-profile",
+                        "DetailType": "address.deleted",
+                        "EventBusName": "${AddressBus}",
+                        "Detail": "{\"userId\": \"$context.authorizer.claims.sub\", \"addressId\": \"$util.escapeJavaScript($input.params('addressId'))\"}"
+                      }]
+                    }
+                responses:
+                  default:
+                    statusCode: "202"
+                    responseTemplates:
+                      application/json: '{"message": "Accepted"}'
+
+          # ---------------------------------------------------------------------------
+          # Favorites -> SQS
+          #
+          # SendMessage is form-encoded, so the body is built as a query string rather
+          # than JSON. CommandName tells the single consumer which operation to run.
+          # ---------------------------------------------------------------------------
+
+          /favorite:
+            post:
+              summary: Accept a new favorite restaurant for asynchronous processing
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - restaurantId
+                      properties:
+                        restaurantId:
+                          type: string
+              responses:
+                "202":
+                  description: Accepted for processing
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${FavoriteRestaurantsQueue.QueueName}"
+                credentials: !GetAtt APIGatewayQueueCommandRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: |
+                    #set($inputRoot = $input.path('$'))
+                    Action=SendMessage&MessageBody=$util.urlEncode($inputRoot.restaurantId)&MessageAttribute.1.Name=CommandName&MessageAttribute.1.Value.StringValue=AddFavorite&MessageAttribute.1.Value.DataType=String&MessageAttribute.2.Name=UserId&MessageAttribute.2.Value.StringValue=$util.urlEncode($context.authorizer.claims.sub)&MessageAttribute.2.Value.DataType=String
+                responses:
+                  default:
+                    statusCode: "202"
+                    responseTemplates:
+                      application/json: '{"message": "Accepted"}'
+
+            get:
+              summary: List the caller's favorite restaurants (synchronous)
+              responses:
+                "200":
+                  description: The caller's favorite restaurants
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListUserFavoritesFunction.Arn}/invocations"
+                passthroughBehavior: when_no_match
+
+          /favorite/{restaurantId}:
+            delete:
+              summary: Accept a favorite restaurant deletion for asynchronous processing
+              parameters:
+                - name: restaurantId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              responses:
+                "202":
+                  description: Accepted for processing
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${FavoriteRestaurantsQueue.QueueName}"
+                credentials: !GetAtt APIGatewayQueueCommandRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: |
+                    Action=SendMessage&MessageBody=$util.urlEncode($input.params('restaurantId'))&MessageAttribute.1.Name=CommandName&MessageAttribute.1.Value.StringValue=DeleteFavorite&MessageAttribute.1.Value.DataType=String&MessageAttribute.2.Name=UserId&MessageAttribute.2.Value.StringValue=$util.urlEncode($context.authorizer.claims.sub)&MessageAttribute.2.Value.DataType=String
+                responses:
+                  default:
+                    statusCode: "202"
+                    responseTemplates:
+                      application/json: '{"message": "Accepted"}'
+
+Outputs:
+  ProfileApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ProfileApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  UserPool:
+    Description: "Cognito User Pool ID"
+    Value: !Ref UserPool
+  UserPoolClient:
+    Description: "Cognito User Pool Application Client ID"
+    Value: !Ref UserPoolClient
+  AddressBus:
+    Description: "EventBridge bus carrying address events"
+    Value: !Ref AddressBus
+  AddressTable:
+    Description: "DynamoDB table holding user addresses"
+    Value: !Ref UserAddressesTable
+  FavoriteTable:
+    Description: "DynamoDB table holding favorite restaurants"
+    Value: !Ref FavoritesTable
+  FavoriteSQSUrl:
+    Description: "SQS queue carrying favorite restaurant commands"
+    Value: !Ref FavoriteRestaurantsQueue
+  CognitoAuthCommand:
+    Description: "AWS CLI command to obtain an ID token for manual testing"
+    Value: !Sub "aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH --client-id ${UserPoolClient} --auth-parameters USERNAME=<username>,PASSWORD=<password> --query 'AuthenticationResult.IdToken' --output text"
