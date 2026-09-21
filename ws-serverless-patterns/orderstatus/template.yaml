@@ -1,19 +1,35 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Serverless Workshop - Polling Pattern
+Description: >
+  SAM Template for ws-serverless-patterns-polling
 
 Parameters:
-  UserPool:
-    Type: String
-    Description: User Pool Id from Users module
   OrdersTablename:
     Type: String
-    Description: Orders DynamoDB table from Orders module
+    Description: OrdersTable name for Orders table in Orders module
+
+  UserPool:
+    Type: String
+    Description: User Pool Id from users module
+
   Stage:
     Type: String
     Default: dev
 
-
 Resources:
-  Nullresource:
-    Type: AWS::CloudFormation::WaitConditionHandle
+  RestaurantBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "Orders-${Stage}"
+
+Outputs:
+
+  RestaurantBusName:
+   Description: "Name of Restaurant EventBridge Bus"
+   Value: !Ref RestaurantBus
+
+  OrdersTablename:
+    Value: !Ref OrdersTablename
+
+  UserPool:
+    Value: !Ref UserPool
