@@ -1,0 +1,19 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Workshop - Polling Pattern
+
+Parameters:
+  UserPool:
+    Type: String
+    Description: User Pool Id from Users module
+  OrdersTablename:
+    Type: String
+    Description: Orders DynamoDB table from Orders module
+  Stage:
+    Type: String
+    Default: dev
+
+
+Resources:
+  Nullresource:
+    Type: AWS::CloudFormation::WaitConditionHandle

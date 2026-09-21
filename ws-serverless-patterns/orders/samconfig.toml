@@ -6,7 +6,7 @@ resolve_s3 = true
 s3_prefix = "ws-serverless-patterns-orders"
 region = "us-east-2"
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "UserPool=\"us-east-2_94iF1PV1h\""
+parameter_overrides = "UserPool=\"us-east-2_a4PAR8As8\""
 image_repositories = []
 
 [default.global.parameters]
